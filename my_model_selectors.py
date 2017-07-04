@@ -1,11 +1,30 @@
 import math
 import statistics
 import warnings
+from collections import defaultdict
 
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 from sklearn.model_selection import KFold
 from asl_utils import combine_sequences
+
+
+def _build_models(self, X=None, lengths=None, X_valid=None, lengths_valid=None):
+    if X_valid is None:
+        X_valid = self.X
+    if lengths_valid is None:
+        lengths_valid = self.lengths
+
+    n_components = range(self.min_n_components, self.max_n_components + 1)
+    for num_states in n_components:
+        model = self.base_model(num_states, X, lengths)
+        if model is None:
+            continue
+        try:
+            score = model.score(X_valid, lengths_valid)
+        except ValueError:
+            score = np.inf
+        yield num_states, model, score
 
 
 class ModelSelector(object):
@@ -31,20 +50,30 @@ class ModelSelector(object):
     def select(self):
         raise NotImplementedError
 
-    def base_model(self, num_states):
+    def base_model(self, num_states, X=None, lengths=None):
+        if X is None:
+            X = self.X
+        if lengths is None:
+            lengths = self.lengths
+
         # with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         # warnings.filterwarnings("ignore", category=RuntimeWarning)
+        hmm_model = GaussianHMM(
+            n_components=num_states, covariance_type="diag", n_iter=1000,
+            random_state=self.random_state, verbose=False)
+
         try:
-            hmm_model = GaussianHMM(n_components=num_states, covariance_type="diag", n_iter=1000,
-                                    random_state=self.random_state, verbose=False).fit(self.X, self.lengths)
+            hmm_model.fit(self.X, self.lengths)
+        except ValueError:
             if self.verbose:
-                print("model created for {} with {} states".format(self.this_word, num_states))
+                print("failure on {} with {} states".format(
+                    self.this_word, num_states))
+        else:
+            if self.verbose:
+                print("model created for {} with {} states".format(
+                    self.this_word, num_states))
             return hmm_model
-        except:
-            if self.verbose:
-                print("failure on {} with {} states".format(self.this_word, num_states))
-            return None
 
 
 class SelectorConstant(ModelSelector):
@@ -76,8 +105,16 @@ class SelectorBIC(ModelSelector):
         """
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection based on BIC scores
-        raise NotImplementedError
+        n = len(self.X)
+        models = []
+        scores = []
+        for num_states, model, logL in _build_models(self):
+            bic = -2 * np.log(logL) + num_states * np.log(n)
+            scores.append(bic)
+            models.append(model)
+
+        if models:
+            return models[np.argmax(scores)]
 
 
 class SelectorDIC(ModelSelector):
@@ -92,8 +129,28 @@ class SelectorDIC(ModelSelector):
     def select(self):
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection based on DIC scores
-        raise NotImplementedError
+        hwords = self.hwords.copy()
+        del hwords[self.this_word]
+        n = len(hwords)
+
+        best_model = None
+        best_score = np.inf
+
+        for num_states, model, logL in _build_models(self):
+            other_scores = []
+            for X, lengths in hwords.values():
+                try:
+                    other_logL = model.score(X, lengths)
+                except ValueError:
+                    pass
+                else:
+                    other_scores.append(other_logL)
+            dic = logL - np.mean(other_scores)
+            if dic < best_score:
+                best_score = dic
+                best_model = model
+
+        return best_model
 
 
 class SelectorCV(ModelSelector):
@@ -104,5 +161,31 @@ class SelectorCV(ModelSelector):
     def select(self):
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection using CV
-        raise NotImplementedError
+        if len(self.lengths) < 3:
+            return self.base_model(self.n_constant)
+
+        best_score = np.inf
+        best_num_states = self.n_constant
+
+        lengths = np.array(self.lengths)
+        idx = np.cumsum(lengths)
+        idx = np.array([idx - lengths, idx]).T
+
+        X = [self.X[i:j] for i, j in idx]
+
+        scores = defaultdict(lambda: [])
+        for cv_train_idx, cv_test_idx in KFold().split(self.lengths):
+            X_train = np.concatenate([X[i] for i in cv_train_idx], axis=0)
+            X_valid = np.concatenate([X[i] for i in cv_test_idx], axis=0)
+            lengths_train = lengths[cv_train_idx]
+            lengths_valid = lengths[cv_test_idx]
+            models = _build_models(
+                self, X=X_train, lengths=lengths_train,
+                X_valid=X_valid, lengths_valid=lengths_valid)
+            for num_states, _, score in models:
+                scores[num_states].append(score)
+
+        num_states = sorted(
+            scores.items(), key=lambda it: np.mean(it[1]))[0][0]
+        model = self.base_model(num_states)
+        return model
